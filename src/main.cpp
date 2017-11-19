@@ -8,6 +8,7 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
 
 using namespace std;
 
@@ -159,6 +160,14 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 }
 
+typedef enum FSM_STATES {
+  CONTINUE_STRAIGHT = 0,
+  PREPARE_LANE_CHANGE_LEFT,
+  PREPARE_LANE_CHANGE_RIGHT,
+  LANE_CHANGE_LEFT,
+  LANE_CHANGE_RIGHT
+} FSM_STATES;
+
 int main() {
   uWS::Hub h;
 
@@ -196,7 +205,13 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  int lane = 1;
+  double ref_vel = 0.0;
+  FSM_STATES fsm_state = CONTINUE_STRAIGHT;
+  const double LANE_CHANGE_SAFE_ZONE_AHEAD = 20;
+  const double LANE_CHANGE_SAFE_ZONE_BEHIND = 5;
+
+  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy,&lane,&ref_vel, &fsm_state, &LANE_CHANGE_SAFE_ZONE_AHEAD, &LANE_CHANGE_SAFE_ZONE_BEHIND](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -233,13 +248,392 @@ int main() {
           	// Sensor Fusion Data, a list of all other cars on the same side of the road.
           	auto sensor_fusion = j[1]["sensor_fusion"];
 
+            int prev_size = previous_path_x.size();
+
+            if (prev_size > 0) {
+              car_s = end_path_s;
+            }
+
+            bool too_close = false;
+
+            switch(fsm_state) {
+              case CONTINUE_STRAIGHT: {
+                // cout << endl << "CONTINUE_STRAIGHT" << endl;
+                double front_car_speed = 0;
+                for (int i = 0; i < sensor_fusion.size(); i++) {
+                  float d = sensor_fusion[i][6];
+                  if ((d > 2 + 4 * lane - 2) && (d < (2 + 4 * lane + 2))) {
+                    double vx = sensor_fusion[i][3];
+                    double vy = sensor_fusion[i][4];
+                    double check_speed = sqrt(pow(vx, 2) + pow(vy, 2));
+                    double check_car_s = sensor_fusion[i][5];
+                    check_car_s += ((double)prev_size * 0.02 * check_speed);
+                    if ((check_car_s > car_s) && ((check_car_s - car_s) < LANE_CHANGE_SAFE_ZONE_AHEAD)) {
+                      cout << "Car " << i << " is close in current lane" << endl;
+                      too_close = true;
+                      front_car_speed = check_car_s;
+                      break;
+                    }
+                  }
+                }
+                if (too_close) {
+                  switch(lane) {
+                    case 0: {
+                      cout << "Checking right lane" << endl;
+                      bool can_go_right = true;
+                      int target_lane = lane + 1;
+                      for (int j = 0; j < sensor_fusion.size(); j++) {
+                        float d = sensor_fusion[j][6];
+                        if ((d > (2 + 4 * target_lane - 2)) && (d < (2 + 4 * target_lane + 2))) {
+                          double vx = sensor_fusion[j][3];
+                          double vy = sensor_fusion[j][4];
+                          double check_speed = sqrt(pow(vx, 2) + pow(vy, 2));
+                          double check_car_s = sensor_fusion[j][5];
+                          check_car_s += ((double)prev_size * 0.02 * check_speed);
+                          if ((check_car_s > car_s - LANE_CHANGE_SAFE_ZONE_BEHIND) && (check_car_s < car_s + LANE_CHANGE_SAFE_ZONE_AHEAD)) {
+                            cout << "Car " << j << " is close in right lane" << endl;
+                            can_go_right = false;
+                            break;
+                          }
+                        }
+                      }
+                      if (can_go_right) {
+                        cout << "Will prepare to change right" << endl;
+                        fsm_state = PREPARE_LANE_CHANGE_RIGHT;
+                        too_close = false;
+                      }
+                      break;
+                    }
+                    case 1: {
+                      cout << "Can try to go left or right" << endl;
+                      double left_min_distance_behind = 9999;
+                      double left_min_distance_ahead = 9999;
+                      double right_min_distance_behind = 9999;
+                      double right_min_distance_ahead = 9999;
+                      double left_car_speed = 0;
+                      double right_car_speed = 0;
+                      bool left_blocked = false;
+                      bool right_blocked = false;
+                      int left_lane = 0;
+                      int right_lane = 2;
+                      for (int j = 0; j < sensor_fusion.size(); j++) {
+                        float d = sensor_fusion[j][6];
+                        if ((d > (2 + 4 * left_lane - 2)) && (d < (2 + 4 * left_lane + 2))) {
+                          double vx = sensor_fusion[j][3];
+                          double vy = sensor_fusion[j][4];
+                          double check_speed = sqrt(pow(vx, 2) + pow(vy, 2));
+                          double check_car_s = sensor_fusion[j][5];
+                          check_car_s += ((double)prev_size * 0.02 * check_speed);
+
+                          double distance_behind = car_s - check_car_s;
+                          double distance_ahead = check_car_s - car_s;
+                          if (car_s == check_car_s) {
+                            left_min_distance_behind = 0;
+                            left_min_distance_ahead = 0;
+                          } else if ((car_s > check_car_s) && (distance_behind < left_min_distance_behind)) {
+                            left_min_distance_behind = distance_behind;
+                          } else if ((car_s < check_car_s) && (distance_ahead < left_min_distance_ahead)) {
+                            left_min_distance_ahead = distance_ahead;
+                            left_car_speed = check_speed;
+                          }
+
+                          if ((check_car_s > car_s - LANE_CHANGE_SAFE_ZONE_BEHIND) && (check_car_s < car_s + LANE_CHANGE_SAFE_ZONE_AHEAD)) {
+                            left_blocked = true;
+                          }
+                        } else if ((d > (2 + 4 * right_lane - 2)) && (d < (2 + 4 * right_lane + 2))) {
+                          double vx = sensor_fusion[j][3];
+                          double vy = sensor_fusion[j][4];
+                          double check_speed = sqrt(pow(vx, 2) + pow(vy, 2));
+                          double check_car_s = sensor_fusion[j][5];
+                          check_car_s += ((double)prev_size * 0.02 * check_speed);
+
+                          double distance_behind = car_s - check_car_s;
+                          double distance_ahead = check_car_s - car_s;
+                          if (car_s == check_car_s) {
+                            right_min_distance_behind = 0;
+                            right_min_distance_ahead = 0;
+                          } else if ((car_s > check_car_s) && (distance_behind < right_min_distance_behind)) {
+                            right_min_distance_behind = distance_behind;
+                          } else if ((car_s < check_car_s) && (distance_ahead < right_min_distance_ahead)) {
+                            right_min_distance_ahead = distance_ahead;
+                            right_car_speed = check_speed;
+                          }
+
+                          if ((check_car_s > car_s - LANE_CHANGE_SAFE_ZONE_BEHIND) && (check_car_s < car_s + LANE_CHANGE_SAFE_ZONE_AHEAD)) {
+                            right_blocked = true;
+                          }
+                        }
+                      }
+                      if (!left_blocked && !right_blocked) {
+                        if (right_min_distance_ahead > left_min_distance_ahead) {
+                          cout << "Left and right are not blocked but right lane has more space, will prepare to change right" << endl;
+                          fsm_state = PREPARE_LANE_CHANGE_RIGHT;
+                        } else {
+                          cout << "Left and right are not blocked but left lane has more space, will prepare to change left" << endl;
+                          fsm_state = PREPARE_LANE_CHANGE_LEFT;
+                        }
+                      } else if (left_blocked && right_blocked) {
+                        if ((right_car_speed > left_car_speed) && (right_car_speed > front_car_speed)) {
+                          cout << "Left and right blocked but right car is faster, will prepare to change right" << endl;
+                          fsm_state = PREPARE_LANE_CHANGE_RIGHT;
+                          too_close = false;
+                        } else if ((left_car_speed > right_car_speed) && (left_car_speed > front_car_speed)) {
+                          cout << "Left and right blocked but left car is faster, will prepare to change left" << endl;
+                          fsm_state = PREPARE_LANE_CHANGE_LEFT;
+                          too_close = false;
+                        } else {
+                          cout << "Left and right blocked, slow down" << endl;
+                        }
+                      } else if (left_blocked) {
+                        cout << "Left lane blocked, will prepare to change right" << endl;
+                        fsm_state = PREPARE_LANE_CHANGE_RIGHT;
+                        too_close = false;
+                      } else {
+                        cout << "Right lane blocked, will prepare to change left" << endl;
+                        fsm_state = PREPARE_LANE_CHANGE_LEFT;
+                        too_close = false;
+                      }
+                      break;
+                    }
+                    case 2: {
+                      cout << "Checking left lane" << endl;
+                      bool can_go_left = true;
+                      int target_lane = lane - 1;
+                      for (int j = 0; j < sensor_fusion.size(); j++) {
+                        float d = sensor_fusion[j][6];
+                        if ((d > (2 + 4 * target_lane - 2)) && (d < (2 + 4 * target_lane + 2))) {
+                          double vx = sensor_fusion[j][3];
+                          double vy = sensor_fusion[j][4];
+                          double check_speed = sqrt(pow(vx, 2) + pow(vy, 2));
+                          double check_car_s = sensor_fusion[j][5];
+                          check_car_s += ((double)prev_size * 0.02 * check_speed);
+                          if ((check_car_s > car_s - LANE_CHANGE_SAFE_ZONE_BEHIND) && (check_car_s < car_s + LANE_CHANGE_SAFE_ZONE_AHEAD)) {
+                            cout << "Car " << j << " is close in left lane" << endl;
+                            can_go_left = false;
+                            break;
+                          }
+                        }
+                      }
+                      if (can_go_left) {
+                        cout << "Will prepare to change left" << endl;
+                        fsm_state = PREPARE_LANE_CHANGE_LEFT;
+                        too_close = false;
+                      }
+                      break;
+                    }
+                  }
+                }
+                break;
+              }
+              case PREPARE_LANE_CHANGE_LEFT: {
+                cout << endl << "PREPARE_LANE_CHANGE_LEFT" << endl;
+                for (int i = 0; i < sensor_fusion.size(); i++) {
+                  float d = sensor_fusion[i][6];
+                  if ((d > 2 + 4 * lane - 2) && (d < (2 + 4 * lane + 2))) {
+                    double vx = sensor_fusion[i][3];
+                    double vy = sensor_fusion[i][4];
+                    double check_speed = sqrt(pow(vx, 2) + pow(vy, 2));
+                    double check_car_s = sensor_fusion[i][5];
+                    check_car_s += ((double)prev_size * 0.02 * check_speed);
+                    if ((check_car_s > car_s) && ((check_car_s - car_s) < LANE_CHANGE_SAFE_ZONE_AHEAD)) {
+                      cout << "Car " << i << " is close in current lane" << endl;
+                      too_close = true;
+                      break;
+                    }
+                  }
+                }
+                bool safe_to_change_lane = true;
+                int target_lane = lane - 1;
+                for (int j = 0; j < sensor_fusion.size(); j++) {
+                  float d = sensor_fusion[j][6];
+                  if ((d > (2 + 4 * target_lane - 2)) && (d < (2 + 4 * target_lane + 2))) {
+                    double vx = sensor_fusion[j][3];
+                    double vy = sensor_fusion[j][4];
+                    double check_speed = sqrt(pow(vx, 2) + pow(vy, 2));
+                    double check_car_s = sensor_fusion[j][5];
+                    check_car_s += ((double)prev_size * 0.02 * check_speed);
+                    if ((check_car_s > car_s - LANE_CHANGE_SAFE_ZONE_BEHIND) && (check_car_s < car_s + LANE_CHANGE_SAFE_ZONE_AHEAD)) {
+                      cout << "Car " << j << " is close in left lane, can't change lane yet" << endl;
+                      safe_to_change_lane = false;
+                      break;
+                    }
+                  }
+                }
+
+                if (safe_to_change_lane) {
+                  cout << "Will change lane to left" << endl;
+                  fsm_state = LANE_CHANGE_LEFT;
+                  too_close = false;
+                } else {
+                  cout << "Unable to change lane, continue straight" << endl;
+                  fsm_state = CONTINUE_STRAIGHT;
+                }
+                break; 
+              }
+              case PREPARE_LANE_CHANGE_RIGHT: {
+                cout << endl << "PREPARE_LANE_CHANGE_RIGHT" << endl;
+                for (int i = 0; i < sensor_fusion.size(); i++) {
+                  float d = sensor_fusion[i][6];
+                  if ((d > 2 + 4 * lane - 2) && (d < (2 + 4 * lane + 2))) {
+                    double vx = sensor_fusion[i][3];
+                    double vy = sensor_fusion[i][4];
+                    double check_speed = sqrt(pow(vx, 2) + pow(vy, 2));
+                    double check_car_s = sensor_fusion[i][5];
+                    check_car_s += ((double)prev_size * 0.02 * check_speed);
+                    if ((check_car_s > car_s) && ((check_car_s - car_s) < LANE_CHANGE_SAFE_ZONE_AHEAD)) {
+                      cout << "Car " << i << " close in current lane" << endl;
+                      too_close = true;
+                      break;
+                    }
+                  }
+                }
+                bool safe_to_change_lane = true;
+                int target_lane = lane + 1;
+                for (int j = 0; j < sensor_fusion.size(); j++) {
+                  float d = sensor_fusion[j][6];
+                  if ((d > (2 + 4 * target_lane - 2)) && (d < (2 + 4 * target_lane + 2))) {
+                    double vx = sensor_fusion[j][3];
+                    double vy = sensor_fusion[j][4];
+                    double check_speed = sqrt(pow(vx, 2) + pow(vy, 2));
+                    double check_car_s = sensor_fusion[j][5];
+                    check_car_s += ((double)prev_size * 0.02 * check_speed);
+                    if ((check_car_s > car_s - LANE_CHANGE_SAFE_ZONE_BEHIND) && (check_car_s < car_s + LANE_CHANGE_SAFE_ZONE_AHEAD)) {
+                      cout << "Car " << j << " is close in right lane, can't change lane yet" << endl;
+                      safe_to_change_lane = false;
+                      break;
+                    }
+                  }
+                }
+
+                if (safe_to_change_lane) {
+                  cout << "Will change lane to right" << endl;
+                  fsm_state = LANE_CHANGE_RIGHT;
+                  too_close = false;
+                } else {
+                  cout << "Unable to change lane, continue straight" << endl;
+                  fsm_state = CONTINUE_STRAIGHT;
+                }
+                break; 
+              }
+              case LANE_CHANGE_LEFT: {
+                cout << endl << "LANE_CHANGE_LEFT" << endl;
+                lane -= 1;
+                fsm_state = CONTINUE_STRAIGHT;
+                break;
+              }
+              case LANE_CHANGE_RIGHT: {
+                cout << endl << "LANE_CHANGE_RIGHT" << endl;
+                lane += 1;
+                fsm_state = CONTINUE_STRAIGHT;
+                break;
+              }
+            }
+
+            if (too_close) {
+              ref_vel -= 0.224;
+            } else if (ref_vel < 49.5) {
+              ref_vel += 0.224;
+            }
+
           	json msgJson;
 
+            vector<double> ptsx;
+            vector<double> ptsy;
+
+            double ref_x = car_x;
+            double ref_y = car_y;
+            double ref_yaw = deg2rad(car_yaw);
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
 
 
           	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+
+            if (prev_size < 2) {
+              double prev_car_x = car_x - cos(car_yaw);
+              double prev_car_y = car_y - sin(car_yaw);
+
+              ptsx.push_back(prev_car_x);
+              ptsx.push_back(car_x);
+              ptsy.push_back(prev_car_y);
+              ptsy.push_back(car_y);
+            } else {
+              ref_x = previous_path_x[prev_size - 1];
+              ref_y = previous_path_y[prev_size - 1];
+
+              double ref_x_prev = previous_path_x[prev_size - 2];
+              double ref_y_prev = previous_path_y[prev_size - 2];
+
+              ref_yaw = atan2(ref_y - ref_y_prev, ref_x - ref_x_prev);
+
+              ptsx.push_back(ref_x_prev);
+              ptsx.push_back(ref_x);
+              ptsy.push_back(ref_y_prev);
+              ptsy.push_back(ref_y);
+            }
+
+            vector<double> next_wp0 = getXY(car_s + 30, 2 + 4 * lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp1 = getXY(car_s + 60, 2 + 4 * lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp2 = getXY(car_s + 90, 2 + 4 * lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+            ptsx.push_back(next_wp0[0]);
+            ptsx.push_back(next_wp1[0]);
+            ptsx.push_back(next_wp2[0]);
+            ptsy.push_back(next_wp0[1]);
+            ptsy.push_back(next_wp1[1]);
+            ptsy.push_back(next_wp2[1]);
+
+            for (int i = 0; i < ptsx.size(); i++) {
+              double shift_x = ptsx[i] - ref_x;
+              double shift_y = ptsy[i] - ref_y;
+
+              ptsx[i] = (shift_x * cos(0 - ref_yaw) - shift_y * sin(0 - ref_yaw));
+              ptsy[i] = (shift_x * sin(0 - ref_yaw) + shift_y * cos(0 - ref_yaw));
+            }
+
+            tk::spline s;
+            s.set_points(ptsx, ptsy);
+
+            for (int i = 0; i < previous_path_x.size(); i++) {
+              next_x_vals.push_back(previous_path_x[i]);
+              next_y_vals.push_back(previous_path_y[i]);
+            }
+
+            double target_x = 30.0;
+            double target_y = s(target_x);
+            double target_dist = sqrt(pow(target_x, 2) + pow(target_y, 2));
+
+            double x_add_on = 0;
+
+            for (int i = 1; i <= 50 - previous_path_x.size(); i++) {
+              double N = (target_dist / (0.02 * ref_vel / 2.24));
+              double x_point = x_add_on + target_x / N;
+              double y_point = s(x_point);
+              x_add_on = x_point;
+              double x_ref = x_point;
+              double y_ref = y_point;
+
+              x_point = (x_ref * cos(ref_yaw) - y_ref * sin(ref_yaw));
+              y_point = (x_ref * sin(ref_yaw) + y_ref * cos(ref_yaw));
+
+              x_point += ref_x;
+              y_point += ref_y;
+
+              next_x_vals.push_back(x_point);
+              next_y_vals.push_back(y_point);
+            }
+
+            // double dist_inc = 0.5;
+            // for(int i = 0; i < 50; i++)
+            // {
+            //   double next_s = car_s + (i + 1) * dist_inc;
+            //   double next_d = 6;
+            //   vector<double> xy = getXY(next_s, next_d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+            //   next_x_vals.push_back(xy[0]);
+            //   next_y_vals.push_back(xy[1]);
+            // }
+            // ~TODO
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
 
